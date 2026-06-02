@@ -7,7 +7,7 @@ use winapi::um::oleidl::LPDROPTARGET;
 use winapi::um::winuser::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetDpiForWindow, GetFocus, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostMessageW,
-    RegisterClassW, ReleaseCapture, SetCapture, SetCursor, SetFocus, SetProcessDpiAwarenessContext,
+    RegisterClassW, ReleaseCapture, SetCapture, SetCursor, SetFocus,
     SetTimer, SetWindowLongPtrW, SetWindowPos, TrackMouseEvent, TranslateMessage, UnregisterClassW,
     CS_OWNDC, GET_XBUTTON_WPARAM, GWLP_USERDATA, HTCLIENT, IDC_ARROW, MSG, SWP_NOMOVE,
     SWP_NOZORDER, TRACKMOUSEEVENT, WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DPICHANGED,
@@ -670,6 +670,14 @@ impl Window<'_> {
                 AdjustWindowRectEx(&mut rect, flags, FALSE, 0);
             }
 
+            // Enter Per-Monitor-Aware-V2 for the current thread so the child window
+            // we are about to create inherits that awareness, independently of the
+            // host process's DPI awareness. Restored on scope exit.
+            // See RustAudio/baseview#107.
+            let _dpi_scope = super::dpi::ThreadDpiAwarenessScope::enter(
+                super::dpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+
             let hwnd = CreateWindowExW(
                 0,
                 window_class as _,
@@ -727,12 +735,9 @@ impl Window<'_> {
             };
             *window_state.handler.borrow_mut() = Some(Box::new(handler));
 
-            // Only works on Windows 10 unfortunately.
-            SetProcessDpiAwarenessContext(
-                winapi::shared::windef::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
-            );
-
-            // Now we can get the actual dpi of the window.
+            // Now we can get the actual dpi of the window. The child window was
+            // created with Per-Monitor-Aware-V2 (via the thread scope guard above),
+            // so `GetDpiForWindow` returns the real per-monitor DPI.
             let new_rect = if let WindowScalePolicy::SystemScaleFactor = options.scale {
                 // Only works on Windows 10 unfortunately.
                 let dpi = GetDpiForWindow(hwnd);
