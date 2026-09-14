@@ -674,27 +674,9 @@ impl Window<'_> {
             // we are about to create inherits that awareness, independently of the
             // host process's DPI awareness. Restored on scope exit.
             // See RustAudio/baseview#107.
-            //
-            // Skipped for OpenGL windows: some AMD/NVIDIA drivers misbehave when
-            // SetThreadDpiAwarenessContext is called immediately before creating a
-            // GL-backed window, corrupting the rendered output. Those windows
-            // instead inherit whatever DPI awareness the host process already
-            // declared for itself -- upstream baseview's fix for the same bug
-            // (RustAudio/baseview#321, landed in RustAudio/baseview#335) takes
-            // the same approach, via a larger DpiScalingStrategy abstraction
-            // that doesn't exist on this pre-refactor baseview line.
-            #[cfg(feature = "opengl")]
-            let wants_opengl = options.gl_config.is_some();
-            #[cfg(not(feature = "opengl"))]
-            let wants_opengl = false;
-
-            let _dpi_scope = if wants_opengl {
-                None
-            } else {
-                Some(super::dpi::ThreadDpiAwarenessScope::enter(
-                    super::dpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-                ))
-            };
+            let _dpi_scope = super::dpi::ThreadDpiAwarenessScope::enter(
+                super::dpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
 
             let hwnd = CreateWindowExW(
                 0,
