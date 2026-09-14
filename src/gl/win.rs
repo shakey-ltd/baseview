@@ -218,7 +218,21 @@ impl GlContext {
             WGL_STENCIL_BITS_ARB, config.stencil_bits as i32,
             WGL_SAMPLE_BUFFERS_ARB, config.samples.is_some() as i32,
             WGL_SAMPLES_ARB, config.samples.unwrap_or(0) as i32,
-            WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB, config.srgb as i32,
+            // Never request an sRGB-*capable* pixel format on Windows, regardless of
+            // `config.srgb`. egui_glow relies on detecting the ARB_framebuffer_sRGB
+            // GL extension at runtime and explicitly disabling GL_FRAMEBUFFER_SRGB to
+            // avoid double gamma-correcting its output (it composites directly in
+            // gamma space). If that detection misses on a given Windows GPU driver --
+            // extension-string reporting quirks are common, especially on core
+            // profile contexts, which is what we request -- the disable call never
+            // fires, and some Windows drivers default an sRGB-capable framebuffer to
+            // actively encoding on write, unlike Apple's OpenGL implementation. That
+            // silently washes out midtones (most visible on subtle gradients, e.g.
+            // metallic knob textures) while leaving near-black/fully-saturated colors
+            // comparatively unaffected. Requesting a non-sRGB-capable framebuffer
+            // makes the toggle a no-op regardless of detection correctness, matching
+            // what already happens on macOS today.
+            WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB, 0,
             0,
         ];
 
