@@ -86,6 +86,20 @@ fn find_wgl_pixel_format(
 ) -> Option<NonZeroI32> {
     let mut format_attribs = PixelFormatAttribs::from_config(config);
 
+    // Never select an sRGB-*capable* pixel format on Windows, regardless of
+    // `config.srgb`. egui_glow (and other consumers) rely on detecting the
+    // ARB_framebuffer_sRGB GL extension at runtime and explicitly disabling
+    // GL_FRAMEBUFFER_SRGB to avoid double gamma-correcting output that's
+    // already composited in gamma space -- but that detection is known to
+    // be unreliable on Core-profile contexts across GPU vendors. If it
+    // misses, some Windows drivers default an sRGB-capable framebuffer to
+    // actively encoding on write (unlike macOS/GLX), silently washing out
+    // midtones. `set_without_srgb_ext()` already existed here as a
+    // pixel-format-selection-failure fallback; using it unconditionally up
+    // front makes the toggle a no-op at the hardware level regardless of
+    // whether that runtime detection succeeds.
+    format_attribs.set_without_srgb_ext();
+
     match extra.choose_pixel_format_from_attribs(&format_attribs, dc) {
         Ok(Some(format)) => return Some(format),
         Err(e) => {
