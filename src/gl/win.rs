@@ -6,11 +6,13 @@ use raw_window_handle::RawWindowHandle;
 use winapi::shared::minwindef::{HINSTANCE, HMODULE};
 use winapi::shared::ntdef::WCHAR;
 use winapi::shared::windef::{HDC, HGLRC, HWND};
+use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::libloaderapi::{FreeLibrary, GetProcAddress, LoadLibraryA};
 use winapi::um::wingdi::{
     wglCreateContext, wglDeleteContext, wglGetProcAddress, wglMakeCurrent, ChoosePixelFormat,
     DescribePixelFormat, SetPixelFormat, SwapBuffers, PFD_DOUBLEBUFFER, PFD_DRAW_TO_WINDOW,
-    PFD_MAIN_PLANE, PFD_SUPPORT_OPENGL, PFD_TYPE_RGBA, PIXELFORMATDESCRIPTOR,
+    PFD_GENERIC_ACCELERATED, PFD_GENERIC_FORMAT, PFD_MAIN_PLANE, PFD_SUPPORT_OPENGL, PFD_TYPE_RGBA,
+    PIXELFORMATDESCRIPTOR,
 };
 use winapi::um::winnt::IMAGE_DOS_HEADER;
 use winapi::um::winuser::{
@@ -59,6 +61,7 @@ const WGL_SAMPLES_ARB: i32 = 0x2042;
 // See https://www.khronos.org/registry/OpenGL/extensions/ARB/ARB_framebuffer_sRGB.txt
 
 const WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB: i32 = 0x20A9;
+const GL_FRAMEBUFFER_SRGB: u32 = 0x8DB9;
 
 // See https://www.khronos.org/registry/OpenGL/extensions/EXT/WGL_EXT_swap_control.txt
 
@@ -203,49 +206,13 @@ impl GlContext {
 
         let hdc = GetDC(hwnd);
 
-        #[rustfmt::skip]
-        let pixel_format_attribs = [
-            WGL_DRAW_TO_WINDOW_ARB, 1,
-            WGL_ACCELERATION_ARB, WGL_FULL_ACCELERATION_ARB,
-            WGL_SUPPORT_OPENGL_ARB, 1,
-            WGL_DOUBLE_BUFFER_ARB, config.double_buffer as i32,
-            WGL_PIXEL_TYPE_ARB, WGL_TYPE_RGBA_ARB,
-            WGL_RED_BITS_ARB, config.red_bits as i32,
-            WGL_GREEN_BITS_ARB, config.green_bits as i32,
-            WGL_BLUE_BITS_ARB, config.blue_bits as i32,
-            WGL_ALPHA_BITS_ARB, config.alpha_bits as i32,
-            WGL_DEPTH_BITS_ARB, config.depth_bits as i32,
-            WGL_STENCIL_BITS_ARB, config.stencil_bits as i32,
-            WGL_SAMPLE_BUFFERS_ARB, config.samples.is_some() as i32,
-            WGL_SAMPLES_ARB, config.samples.unwrap_or(0) as i32,
-            // Never request an sRGB-*capable* pixel format on Windows, regardless of
-            // `config.srgb`. egui_glow relies on detecting the ARB_framebuffer_sRGB
-            // GL extension at runtime and explicitly disabling GL_FRAMEBUFFER_SRGB to
-            // avoid double gamma-correcting its output (it composites directly in
-            // gamma space). If that detection misses on a given Windows GPU driver --
-            // extension-string reporting quirks are common, especially on core
-            // profile contexts, which is what we request -- the disable call never
-            // fires, and some Windows drivers default an sRGB-capable framebuffer to
-            // actively encoding on write, unlike Apple's OpenGL implementation. That
-            // silently washes out midtones (most visible on subtle gradients, e.g.
-            // metallic knob textures) while leaving near-black/fully-saturated colors
-            // comparatively unaffected. Requesting a non-sRGB-capable framebuffer
-            // makes the toggle a no-op regardless of detection correctness, matching
-            // what already happens on macOS today.
-            WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB, 0,
-            0,
-        ];
-
-        let mut pixel_format = 0;
-        let mut num_formats = 0;
-        wglChoosePixelFormatARB.unwrap()(
-            hdc,
-            pixel_format_attribs.as_ptr(),
-            std::ptr::null(),
-            1,
-            &mut pixel_format,
-            &mut num_formats,
-        );
+        let Some((pixel_format, source)) =
+            choose_pixel_format(hdc, &config, wglChoosePixelFormatARB)
+        else {
+            log::error!("baseview: no usable OpenGL pixel format found; cannot create GL context");
+            ReleaseDC(hwnd, hdc);
+            return Err(GlError::CreationFailed(()));
+        };
 
         let mut pfd: PIXELFORMATDESCRIPTOR = std::mem::zeroed();
         DescribePixelFormat(
@@ -254,7 +221,16 @@ impl GlContext {
             std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u32,
             &mut pfd,
         );
-        SetPixelFormat(hdc, pixel_format, &pfd);
+        // A window's pixel format can only be set once, so there is no fallback past this point.
+        if SetPixelFormat(hdc, pixel_format, &pfd) == 0 {
+            log::error!(
+                "baseview: SetPixelFormat({pixel_format}) failed (GetLastError = {})",
+                GetLastError()
+            );
+            ReleaseDC(hwnd, hdc);
+            return Err(GlError::CreationFailed(()));
+        }
+        log::info!("baseview: using OpenGL pixel format {pixel_format} ({source})");
 
         let profile_mask = match config.profile {
             Profile::Core => WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
@@ -269,9 +245,24 @@ impl GlContext {
             0
         ];
 
-        let hglrc =
-            wglCreateContextAttribsARB.unwrap()(hdc, std::ptr::null_mut(), ctx_attribs.as_ptr());
+        #[allow(non_snake_case)]
+        let Some(wglCreateContextAttribsARB) = wglCreateContextAttribsARB
+        else {
+            log::error!(
+                "baseview: wglCreateContextAttribsARB is unavailable; cannot create GL context"
+            );
+            ReleaseDC(hwnd, hdc);
+            return Err(GlError::CreationFailed(()));
+        };
+        let hglrc = wglCreateContextAttribsARB(hdc, std::ptr::null_mut(), ctx_attribs.as_ptr());
         if hglrc.is_null() {
+            log::error!(
+                "baseview: wglCreateContextAttribsARB failed for OpenGL {}.{} (GetLastError = {})",
+                config.version.0,
+                config.version.1,
+                GetLastError()
+            );
+            ReleaseDC(hwnd, hdc);
             return Err(GlError::CreationFailed(()));
         }
 
@@ -279,7 +270,22 @@ impl GlContext {
         let gl_library = LoadLibraryA(gl_library_name.as_ptr());
 
         wglMakeCurrent(hdc, hglrc);
-        wglSwapIntervalEXT.unwrap()(config.vsync as i32);
+        if let Some(wgl_swap_interval_ext) = wglSwapIntervalEXT {
+            wgl_swap_interval_ext(config.vsync as i32);
+        } else {
+            log::warn!("baseview: wglSwapIntervalEXT is unavailable; vsync left at driver default");
+        }
+        // The chosen format may be sRGB-capable (it is the first candidate). Such a framebuffer
+        // only encodes on write while GL_FRAMEBUFFER_SRGB is enabled; egui_glow composites in
+        // gamma space and only disables it when its extension-string detection succeeds, which
+        // is unreliable on core profiles on some Windows drivers. Disable it here (core since
+        // GL 3.0) so output is never double gamma-corrected, whichever format was chosen.
+        let gl_disable_name = CString::new("glDisable").unwrap();
+        let gl_disable = GetProcAddress(gl_library, gl_disable_name.as_ptr());
+        if !gl_disable.is_null() {
+            let gl_disable: extern "system" fn(u32) = std::mem::transmute(gl_disable);
+            gl_disable(GL_FRAMEBUFFER_SRGB);
+        }
         wglMakeCurrent(hdc, std::ptr::null_mut());
 
         Ok(GlContext { hwnd, hdc, hglrc, gl_library })
@@ -319,4 +325,148 @@ impl Drop for GlContext {
             FreeLibrary(self.gl_library);
         }
     }
+}
+
+/// Picks a pixel format for `hdc`, trying candidates in order of how likely they are to work and
+/// validating each one. Every rejected candidate is logged before moving on to the next.
+///
+/// sRGB capability is not used to control gamma (see the `glDisable(GL_FRAMEBUFFER_SRGB)` in
+/// [`GlContext::create`]), so `config.srgb` is deliberately ignored here: an sRGB-capable format
+/// is simply the most widely available one. Forcing a non-sRGB-capable format first (3e5975e)
+/// crashed the plug-in host with an access violation on an AMD Radeon Vega 8 machine.
+#[allow(non_snake_case)]
+unsafe fn choose_pixel_format(
+    hdc: HDC, config: &GlConfig, wglChoosePixelFormatARB: Option<WglChoosePixelFormatARB>,
+) -> Option<(i32, &'static str)> {
+    if let Some(wglChoosePixelFormatARB) = wglChoosePixelFormatARB {
+        #[rustfmt::skip]
+        let base_attribs = [
+            WGL_DRAW_TO_WINDOW_ARB, 1,
+            WGL_ACCELERATION_ARB, WGL_FULL_ACCELERATION_ARB,
+            WGL_SUPPORT_OPENGL_ARB, 1,
+            WGL_DOUBLE_BUFFER_ARB, config.double_buffer as i32,
+            WGL_PIXEL_TYPE_ARB, WGL_TYPE_RGBA_ARB,
+            WGL_RED_BITS_ARB, config.red_bits as i32,
+            WGL_GREEN_BITS_ARB, config.green_bits as i32,
+            WGL_BLUE_BITS_ARB, config.blue_bits as i32,
+            WGL_ALPHA_BITS_ARB, config.alpha_bits as i32,
+            WGL_DEPTH_BITS_ARB, config.depth_bits as i32,
+            WGL_STENCIL_BITS_ARB, config.stencil_bits as i32,
+            WGL_SAMPLE_BUFFERS_ARB, config.samples.is_some() as i32,
+            WGL_SAMPLES_ARB, config.samples.unwrap_or(0) as i32,
+        ];
+
+        // `None` omits WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB entirely, for drivers that don't support
+        // the sRGB extension (naming an unsupported attribute makes the whole request fail).
+        let candidates: [(Option<i32>, &'static str); 3] =
+            [(Some(1), "sRGB-capable"), (Some(0), "non-sRGB-capable"), (None, "no sRGB attribute")];
+        for (srgb_capable, label) in candidates {
+            let mut attribs = base_attribs.to_vec();
+            if let Some(value) = srgb_capable {
+                attribs.extend_from_slice(&[WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB, value]);
+            }
+            attribs.push(0);
+
+            let mut pixel_format = 0;
+            let mut num_formats = 0;
+            let ok = wglChoosePixelFormatARB(
+                hdc,
+                attribs.as_ptr(),
+                std::ptr::null(),
+                1,
+                &mut pixel_format,
+                &mut num_formats,
+            );
+            if ok == 0 {
+                log::error!(
+                    "baseview: wglChoosePixelFormatARB failed for {label} format \
+                     (GetLastError = {}); trying next fallback",
+                    GetLastError()
+                );
+                continue;
+            }
+            if num_formats == 0 {
+                log::error!("baseview: no {label} pixel format available; trying next fallback");
+                continue;
+            }
+            match validate_pixel_format(hdc, pixel_format, config) {
+                Ok(()) => return Some((pixel_format, label)),
+                Err(reason) => log::error!(
+                    "baseview: rejected {label} pixel format {pixel_format}: {reason}; \
+                     trying next fallback"
+                ),
+            }
+        }
+    } else {
+        log::error!("baseview: wglChoosePixelFormatARB is unavailable; trying ChoosePixelFormat");
+    }
+
+    // Last resort: the pre-WGL-extension API, which returns the closest match rather than
+    // requiring an exact one.
+    let pfd = PIXELFORMATDESCRIPTOR {
+        nSize: std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u16,
+        nVersion: 1,
+        dwFlags: PFD_DRAW_TO_WINDOW
+            | PFD_SUPPORT_OPENGL
+            | if config.double_buffer { PFD_DOUBLEBUFFER } else { 0 },
+        iPixelType: PFD_TYPE_RGBA,
+        cColorBits: config
+            .red_bits
+            .saturating_add(config.green_bits)
+            .saturating_add(config.blue_bits),
+        cAlphaBits: config.alpha_bits,
+        cDepthBits: config.depth_bits,
+        cStencilBits: config.stencil_bits,
+        iLayerType: PFD_MAIN_PLANE,
+        ..std::mem::zeroed()
+    };
+    let pixel_format = ChoosePixelFormat(hdc, &pfd);
+    if pixel_format == 0 {
+        log::error!("baseview: ChoosePixelFormat failed (GetLastError = {})", GetLastError());
+        return None;
+    }
+    match validate_pixel_format(hdc, pixel_format, config) {
+        Ok(()) => Some((pixel_format, "ChoosePixelFormat fallback")),
+        Err(reason) => {
+            log::error!(
+                "baseview: rejected ChoosePixelFormat pixel format {pixel_format}: {reason}"
+            );
+            None
+        }
+    }
+}
+
+/// Checks that `pixel_format` can actually back an accelerated OpenGL window, so a format a driver
+/// hands back but can't render with is skipped instead of crashing later inside the driver.
+unsafe fn validate_pixel_format(
+    hdc: HDC, pixel_format: i32, config: &GlConfig,
+) -> Result<(), String> {
+    let mut pfd: PIXELFORMATDESCRIPTOR = std::mem::zeroed();
+    if DescribePixelFormat(
+        hdc,
+        pixel_format,
+        std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u32,
+        &mut pfd,
+    ) == 0
+    {
+        return Err(format!("DescribePixelFormat failed (GetLastError = {})", GetLastError()));
+    }
+
+    let required = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL;
+    if pfd.dwFlags & required != required {
+        return Err("cannot draw to a window with OpenGL".into());
+    }
+    if config.double_buffer && pfd.dwFlags & PFD_DOUBLEBUFFER == 0 {
+        return Err("not double-buffered".into());
+    }
+    if pfd.iPixelType != PFD_TYPE_RGBA {
+        return Err("not RGBA".into());
+    }
+    if pfd.cColorBits < 24 {
+        return Err(format!("only {} colour bits", pfd.cColorBits));
+    }
+    if pfd.dwFlags & PFD_GENERIC_FORMAT != 0 && pfd.dwFlags & PFD_GENERIC_ACCELERATED == 0 {
+        return Err("software renderer (Microsoft GDI Generic)".into());
+    }
+    Ok(())
 }
